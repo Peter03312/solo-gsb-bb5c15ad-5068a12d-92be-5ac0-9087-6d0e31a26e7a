@@ -221,6 +221,52 @@ CREATE TABLE IF NOT EXISTS calibrations (
 
 CREATE INDEX IF NOT EXISTS idx_calibrations_device
   ON calibrations (device_no, calibrated_at, id);
+
+-- 配重块实物：按现有质量规格登记唯一实物编号（item_no 全局唯一，为幂等键：
+-- 同号同内容重复登记返回原记录，异内容拒绝；已注销编号仍被占用）。
+-- status：available（在库可领）/ checked_out（领出未还）/ damaged（归还报损，
+-- 不得再次领用）/ deregistered（已注销）。有效实物 = 未注销（含领出与损坏）；
+-- 同规格有效实物数不得超过当前库存（登记时与库存缩减时均核对）。
+CREATE TABLE IF NOT EXISTS weight_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_no TEXT NOT NULL UNIQUE,
+  mass REAL NOT NULL,
+  status TEXT NOT NULL DEFAULT 'available'
+    CHECK (status IN ('available', 'checked_out', 'damaged', 'deregistered')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  deregistered_at TEXT
+);
+
+-- 配重块领用单：凭生效预约在其左闭右开时段内领用；一个预约至多领用一次
+-- （reservation_id UNIQUE 兜底；同内容重试返回原单，异内容拒绝）。
+-- 冻结预约时段与占用量快照：之后预约取消、库存调整或运行状态变化均不改写
+-- 领还历史；逾期判定按冻结终点计算。
+CREATE TABLE IF NOT EXISTS checkouts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  reservation_id INTEGER NOT NULL UNIQUE,
+  usage_json TEXT NOT NULL,
+  reservation_start_utc TEXT NOT NULL,
+  reservation_end_utc TEXT NOT NULL,
+  checked_out_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (reservation_id) REFERENCES reservations(id)
+);
+
+-- 领用明细：每件实物一行（实物编号与规格随单冻结）；归还时逐件标记
+-- 完好（intact）/损坏（damaged）。同一实物至多处于一张未归还领用单
+-- （部分唯一索引兜底）；归还整单原子完成，冲突不留部分记录。
+CREATE TABLE IF NOT EXISTS checkout_items (
+  checkout_id INTEGER NOT NULL REFERENCES checkouts(id),
+  item_id INTEGER NOT NULL REFERENCES weight_items(id),
+  item_no TEXT NOT NULL,
+  mass REAL NOT NULL,
+  returned_at TEXT,
+  condition TEXT CHECK (condition IS NULL OR condition IN ('intact', 'damaged')),
+  PRIMARY KEY (checkout_id, item_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_checkout_items_active_item
+  ON checkout_items (item_id) WHERE returned_at IS NULL;
 `;
 
 // 既有库平滑升级：runs 增加开始时冻结的校准依据列（老库无此列时补齐；
@@ -771,4 +817,123 @@ export function insertCalibration(db, { calibNo, deviceNo, calibratedAt, expires
     )
     .run(calibNo, deviceNo, calibratedAt, expiresAt, passed ? 1 : 0);
   return getCalibrationRow(db, info.lastInsertRowid);
+}
+
+// ---------- 配重块实物与领还（由 server 在单事务内调用） ----------
+
+export function getItemRow(db, id) {
+  return db.prepare('SELECT * FROM weight_items WHERE id = ?').get(id);
+}
+
+export function getItemRowByNo(db, itemNo) {
+  return db.prepare('SELECT * FROM weight_items WHERE item_no = ?').get(itemNo);
+}
+
+export function listItemRows(db) {
+  return db.prepare('SELECT * FROM weight_items ORDER BY mass, item_no, id').all();
+}
+
+// 登记实物：规格存在性与「有效实物数 ≤ 当前库存」由 server 在同事务内核验。
+export function insertItem(db, { itemNo, mass }) {
+  const info = db
+    .prepare('INSERT INTO weight_items (item_no, mass) VALUES (?, ?)')
+    .run(itemNo, mass);
+  return getItemRow(db, info.lastInsertRowid);
+}
+
+// 注销：仅在库 / 损坏状态可注销（已领出实物不能注销；条件更新，未命中返回 null）。
+export function deregisterItem(db, id, nowIso) {
+  const info = db
+    .prepare(
+      `UPDATE weight_items
+          SET status = 'deregistered', deregistered_at = ?
+        WHERE id = ? AND status IN ('available', 'damaged')`,
+    )
+    .run(nowIso, id);
+  return info.changes === 1 ? getItemRow(db, id) : null;
+}
+
+// 状态流转（领出 / 归还完好 / 归还报损），由 server 在同事务内调用。
+export function setItemStatus(db, id, status) {
+  db.prepare('UPDATE weight_items SET status = ? WHERE id = ?').run(status, id);
+}
+
+// 各规格有效实物数（未注销：含在库、领出、损坏）——库存缩减核对用。
+export function countActiveItemsByMass(db) {
+  return db
+    .prepare(
+      `SELECT mass, COUNT(*) AS count FROM weight_items
+        WHERE status != 'deregistered' GROUP BY mass ORDER BY mass`,
+    )
+    .all();
+}
+
+export function getCheckoutRow(db, id) {
+  return db.prepare('SELECT * FROM checkouts WHERE id = ?').get(id);
+}
+
+export function getCheckoutRowByReservation(db, reservationId) {
+  return db.prepare('SELECT * FROM checkouts WHERE reservation_id = ?').get(reservationId);
+}
+
+export function listCheckoutRows(db) {
+  return db.prepare('SELECT * FROM checkouts ORDER BY checked_out_at DESC, id DESC').all();
+}
+
+// 领用：冻结预约时段与占用量快照（server 同事务内完成全部核验后调用）。
+export function insertCheckout(
+  db,
+  { reservationId, usage, reservationStartUtc, reservationEndUtc, checkedOutAt },
+) {
+  const info = db
+    .prepare(
+      `INSERT INTO checkouts
+         (reservation_id, usage_json, reservation_start_utc, reservation_end_utc, checked_out_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(
+      reservationId,
+      JSON.stringify(usage ?? []),
+      reservationStartUtc,
+      reservationEndUtc,
+      checkedOutAt,
+    );
+  return getCheckoutRow(db, info.lastInsertRowid);
+}
+
+export function listCheckoutItemRows(db, checkoutId) {
+  return db
+    .prepare('SELECT * FROM checkout_items WHERE checkout_id = ? ORDER BY mass, item_no')
+    .all(checkoutId);
+}
+
+export function insertCheckoutItem(db, { checkoutId, itemId, itemNo, mass }) {
+  db.prepare(
+    `INSERT INTO checkout_items (checkout_id, item_id, item_no, mass)
+     VALUES (?, ?, ?, ?)`,
+  ).run(checkoutId, itemId, itemNo, mass);
+}
+
+// 实物当前所在的未归还领用明细（含领用单号）；无则 undefined。
+export function getActiveCheckoutItemRow(db, itemId) {
+  return db
+    .prepare(
+      `SELECT ci.*, c.reservation_id
+         FROM checkout_items ci
+         JOIN checkouts c ON c.id = ci.checkout_id
+        WHERE ci.item_id = ? AND ci.returned_at IS NULL`,
+    )
+    .get(itemId);
+}
+
+// 归还：仅未归还的明细可标记（条件更新，未命中返回 null）。
+export function markCheckoutItemReturned(db, checkoutId, itemId, { condition, returnedAt }) {
+  const info = db
+    .prepare(
+      `UPDATE checkout_items
+          SET returned_at = ?, condition = ?
+        WHERE checkout_id = ? AND item_id = ? AND returned_at IS NULL`,
+    )
+    .run(returnedAt, condition, checkoutId, itemId);
+  return info.changes === 1;
 }
