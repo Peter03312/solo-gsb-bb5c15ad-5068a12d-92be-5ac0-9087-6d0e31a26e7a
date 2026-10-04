@@ -89,6 +89,15 @@
 同设备校准时间不晚于上一条返回 409。原运行开始输入及同号重放约定保持兼容
 （同号同内容重放不重新核对校准，仍返回原冻结记录）。
 
+现场按**实物编号**追踪配重块领还：按现有质量规格登记**唯一实物编号**（同规格在册——
+未注销——实物数不得超过当前库存；**已领出实物不能注销**；库存缩减若低于在册实物数，
+配重块整表替换**整次拒绝**）。凭**生效预约**在其左闭右开时段内领用：所选实物按规格
+**精确匹配**预约冻结占用量，且均未被其他未归还领用占用；**同一预约只可领用一次**，
+同内容重试返回原单、异内容拒绝。归还时逐件标记**完好 / 损坏**：**非本单实物及重复
+归还整次拒绝**，损坏件不得再次领用；**预约结束后仍可归还**，查询展示**未还件与逾期
+状态**。预约取消、库存调整及运行状态变化均**不改写领还历史**；领还冲突不留部分记录；
+既有预约、运行接口输入及冻结依据保持兼容。
+
 ## 约束模型
 
 - 孔位编号 `0 … N-1`，孔位数 N 为 4–12 的偶数；孔 `i` 与孔 `i + N/2` 对径，孔 `i` 与孔 `(i+1)%N` 环形相邻。
@@ -258,15 +267,29 @@ npm test
     4. 设备开始运行时按其最新一条校准记录在原事务内放行：结论合格且到期时间不早于
        本次预约终点方可开始；不合格或有效期不足会在开始时提示原因（不留运行）。
        无校准记录的设备不受此限制。开始后冻结校准依据，之后新增记录不改写历史。
+15. **配重块实物领还**（按实物编号追踪）：
+    1. 按现有质量规格登记唯一实物编号（`POST /api/weight-items`）：同规格在册
+       （未注销）实物数不得超过当前库存；同号同规格重试返回原记录，同号异规格拒绝。
+    2. 凭生效预约在其左闭右开时段内领用（`POST /api/checkouts`）：所选实物按规格
+       精确匹配预约冻结占用量，且均未被其他未归还领用占用；同一预约只可领用一次，
+       同内容重试返回原单、异内容 409。
+    3. 归还时逐件标记完好（`intact`）/损坏（`damaged`），可分批
+       （`POST /api/checkouts/:id/return`）：非本单实物及重复归还整次拒绝；
+       损坏件不得再次领用；预约结束后仍可归还。
+    4. 不再使用的实物可注销（`POST /api/weight-items/:serial/retire`）：
+       已领出未归还的实物不能注销；注销后在册数下降，库存方可相应缩减。
+    5. 查询（`GET /api/checkouts` / `/api/checkouts/:id`）展示逐件状态、未还件
+       与逾期状态（已过预约终点且仍有未还件）；预约取消、库存调整及运行状态
+       变化均不改写领还历史。
 
 ## REST API 摘要
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/state` | 当前录入数据（含避邻对与固定孔位）、数据指纹、草稿（含是否过期）、发布列表、核验列表、预约与停用列表、离心运行列表（`runs`）、设备保养状态列表（`devices`，含每台设备最新校准）、保养记录列表（`maintenances`）与设备校准记录列表（`calibrations`） |
+| GET | `/api/state` | 当前录入数据（含避邻对与固定孔位）、数据指纹、草稿（含是否过期）、发布列表、核验列表、预约与停用列表、离心运行列表（`runs`）、设备保养状态列表（`devices`，含每台设备最新校准）、保养记录列表（`maintenances`）、设备校准记录列表（`calibrations`）、配重块实物编号列表（`weightItems`）与领还列表（`checkouts`） |
 | PUT | `/api/config` | 整体替换转子配置（孔位数、容差、各孔最大承重），事务；缩小孔数使现有固定孔位越界时整次拒绝 |
 | PUT | `/api/tubes` | 整体替换全部离心管，事务，校验失败回滚；替换后若留下失效避邻对（对中管不再存在）或失效固定孔位（管不存在或孔位不再可用）拒绝并保留原数据 |
-| PUT | `/api/weights` | 整体替换全部配重规格，事务，校验失败回滚 |
+| PUT | `/api/weights` | 整体替换全部配重规格，事务，校验失败回滚；库存缩减若低于已登记的在册（未注销）实物数则整次拒绝并保留原数据 |
 | GET | `/api/exclusions` | 当前避邻对列表（按编号字典序规范化存储） |
 | PUT | `/api/exclusions` | 整体替换避邻对，事务；未知编号、自配对、重复配对（含颠倒）整次拒绝并回滚 |
 | GET | `/api/fixed-slots` | 当前固定孔位列表（按孔位升序规范化存储，`[{tube, hole}]`） |
@@ -302,6 +325,13 @@ npm test
 | POST | `/api/calibrations` | 登记设备校准（只追加：唯一校准单号 + 设备编号 + UTC 校准时间 + UTC 到期时间 + 布尔结论 `passed`）；校准时间须早于到期时间且不晚于服务端当前时刻，同设备校准时间须晚于上一条；201 新建、200 同号同内容幂等重放、400 非法输入（不留记录）、409 同号异内容（附 `existingId`）或同设备校准时间不晚于上一条（附 `existingId`，不留记录） |
 | GET | `/api/calibrations` | 校准记录列表（按校准时间倒序；字段含结论 `passed` 与展示阶段 `phase`=`valid`/`failed`/`expired`）；可加 `?deviceNo=` 仅查一台设备（非法设备编号 400） |
 | GET | `/api/calibrations/:id` | 单条校准记录；不存在返回 404 |
+| GET | `/api/weight-items` | 配重块实物编号列表（规格、状态 `active`/`damaged`/`retired`、当前是否领出及所在领用单） |
+| POST | `/api/weight-items` | 登记实物编号（唯一编号 + 现有质量规格）；同规格在册数不得超过当前库存；201 新建、200 同号同规格幂等、400 非法输入/未知规格、409 同号异规格或超库存（附 `detail`） |
+| POST | `/api/weight-items/:serial/retire` | 注销实物（已领出未归还不能注销 409，附 `detail.checkoutId`）；已注销幂等返回原记录；不存在 404 |
+| POST | `/api/checkouts` | 凭生效预约在左闭右开时段内领用（`reservationId` + 实物编号清单，按规格精确匹配冻结占用量且均未被他单占用）；事务内核对，失败不留记录；201 新建、200 同预约同清单幂等、400 非法输入/未知预约/未登记实物/清单不符、409 预约已取消/时段外/实物损坏或注销或被占用/同预约异清单（附 `existingId`） |
+| GET | `/api/checkouts` | 领用单列表（逐件状态、未还件、逾期状态；可加 `?reservationId=` 按预约过滤，非法编号 400） |
+| GET | `/api/checkouts/:id` | 单条领用单详情（逐件状态、未还件、逾期、冻结预约时段与占用量）；不存在 404 |
+| POST | `/api/checkouts/:id/return` | 归还（逐件 `{serial, condition:intact/damaged}`，可分批）；非本单实物及重复归还整次拒绝 409；损坏件不得再次领用；预约结束后仍可归还；领用单不存在 404 |
 | GET | `/api/schedule?from=&to=` | 日程：各质量规格在时段内的预约占用分段（`segments`，占用超库存 `shortage`）、停用分段（`suspendedSegments`）与「占用+停用」合计分段（`combinedSegments`，合计超库存 `shortage` / 规格级 `combinedShortage`）；from/to 缺省为覆盖全部生效中预约与停用 |
 
 错误统一返回 `400 {"error","errors":[...]}`；状态冲突（草稿已存在、版本过期、核验已冻结、
@@ -792,12 +822,104 @@ curl -s -X POST $BASE/api/runs -H 'Content-Type: application/json' \
 #    同运行编号同内容重放仍返回原冻结记录（200，不重新核对校准）。
 ```
 
+## 配重块实物领还 HTTP API 调用示例
+
+```bash
+BASE=http://localhost:8080
+
+# 0) 前置：已发布且「当前可用」的装载图 #1（冻结图占用如 50 g × 1）、
+#    覆盖当前时刻的生效预约 #7（左闭右开 [start, end)）、
+#    配重块录入规格 50 g（数量 ≥ 2）
+curl -s -X PUT $BASE/api/weights -H 'Content-Type: application/json' \
+  -d '[{"mass":50,"quantity":2}]' > /dev/null
+
+# 1) 登记实物编号：唯一编号 + 现有质量规格
+#    同规格在册（未注销）实物数不得超过当前库存
+curl -s -X POST $BASE/api/weight-items \
+  -H 'Content-Type: application/json' \
+  -d '{"serial":"W50-001","mass":50}'
+# -> 201 {"serial":"W50-001","mass":50,"status":"active",
+#         "createdAt":"...","retiredAt":null,"checkedOut":false,"checkoutId":null}
+curl -s -X POST $BASE/api/weight-items \
+  -H 'Content-Type: application/json' \
+  -d '{"serial":"W50-002","mass":50}'
+
+# 幂等：同号同规格 → 200 原记录；同号异规格 → 409
+curl -s -X POST $BASE/api/weight-items \
+  -H 'Content-Type: application/json' -d '{"serial":"W50-001","mass":50}'   # 200
+curl -s -X POST $BASE/api/weight-items \
+  -H 'Content-Type: application/json' -d '{"serial":"W50-001","mass":100}'  # 409
+
+# 超库存（50 g 库存 2，已登记 2 件）→ 409；未知规格 → 400；均不留记录
+curl -s -X POST $BASE/api/weight-items \
+  -H 'Content-Type: application/json' -d '{"serial":"W50-003","mass":50}'
+# -> 409 {"errors":["规格 50 g 当前库存 2 枚，已登记在册实物 2 件，再登记「W50-003」将超过库存，拒绝登记"],
+#         "detail":{"mass":50,"capacity":2,"registered":2}}
+
+# 2) 领用：凭生效预约 #7 在其左闭右开时段内领用；
+#    所选实物按规格精确匹配预约冻结占用量（本例 50 g × 1 → 恰好选 1 件 50 g）
+curl -s -X POST $BASE/api/checkouts \
+  -H 'Content-Type: application/json' \
+  -d '{"reservationId":7,"items":["W50-001"]}'
+# -> 201 {"id":1,"reservationId":7,"batchNo":"BATCH-001","createdAt":"...（服务端记录）",
+#         "reservation":{"startUtc":"...","endUtc":"...","usage":[{"mass":50,"count":1}],
+#                        "currentStatus":"active"},
+#         "items":[{"serial":"W50-001","mass":50,"state":"out","returnedAt":null}],
+#         "total":1,"returnedCount":0,"unreturnedCount":1,"unreturned":["W50-001"],
+#         "status":"open","overdue":false,"closedAt":null}
+
+# 同一预约只可领用一次：同内容重试 → 200 原单；异内容 → 409（附 existingId）
+curl -s -X POST $BASE/api/checkouts \
+  -H 'Content-Type: application/json' -d '{"reservationId":7,"items":["W50-001"]}'  # 200 原单
+curl -s -X POST $BASE/api/checkouts \
+  -H 'Content-Type: application/json' -d '{"reservationId":7,"items":["W50-002"]}'
+# -> 409 {"errors":["预约 #7 已存在领用单 #1（同一预约只可领用一次），且本次实物清单与其不同，拒绝重复领用"],
+#         "existingId":1}
+
+# 典型拒绝（均不留记录）：
+#   未登记实物 / 清单与冻结占用量不符（件数或规格不精确匹配）→ 400
+#   预约已取消 / 未到时段 / 已过终点 / 实物损坏或已注销 / 被他单占用 → 409
+curl -s -X POST $BASE/api/checkouts \
+  -H 'Content-Type: application/json' -d '{"reservationId":8,"items":["W50-001"]}'
+# -> 409 {"errors":["所选实物当前不可领用：","实物「W50-001」当前被领用单 #1 占用（未归还）"]}
+
+# 3) 归还：逐件标记完好（intact）/损坏（damaged），可分批；预约结束后仍可归还
+curl -s -X POST $BASE/api/checkouts/1/return \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[{"serial":"W50-001","condition":"intact"}]}'
+# -> 200 {"id":1,"status":"closed","closedAt":"...","unreturned":[],...}
+# 非本单实物 / 重复归还 → 409 整次拒绝（不留部分记录）：
+curl -s -X POST $BASE/api/checkouts/1/return \
+  -H 'Content-Type: application/json' -d '{"items":[{"serial":"W50-001","condition":"intact"}]}'
+# -> 409 {"errors":["以下实物已归还（重复归还），整次拒绝：「W50-001」"]}
+# 归还时报损（condition:"damaged"）的实物状态变为 damaged，损坏件不得再次领用（领用 409）
+
+# 4) 查询：列表 / 单条 / 按预约过滤；展示未还件与逾期状态
+#    （逾期 = 已过预约终点且仍有未还件；预约结束后仍可归还）
+curl -s $BASE/api/weight-items            # 各实物状态与当前所在领用单
+curl -s $BASE/api/checkouts               # 全部领用单（未还件、逾期状态）
+curl -s $BASE/api/checkouts/1             # 单条详情（冻结预约时段与占用量）
+curl -s "$BASE/api/checkouts?reservationId=7"
+
+# 5) 注销：已领出（未归还）的实物不能注销（409）；归还后可注销；已注销幂等 200
+curl -s -X POST $BASE/api/weight-items/W50-001/retire
+# -> 200 {"serial":"W50-001","status":"retired","retiredAt":"...",...}
+
+# 6) 库存缩减若低于在册实物数则整次拒绝（PUT /api/weights 保持原数据）：
+#    在册 50 g 实物 1 件（W50-002）时，删除该规格（在册 1 件 > 0 枚）→ 400 整次拒绝
+curl -s -X PUT $BASE/api/weights -H 'Content-Type: application/json' -d '[]'
+# -> 400 {"errors":["本次配重块调整会使库存低于已登记的在册实物数（未注销），已拒绝并保留原数据：",
+#                   "规格 50 g：在册实物 1 件，调整后库存 0 枚", ...]}
+# 先注销 W50-002 后即可缩减；库存调整不改写既有领还历史（冻结时段/占用量/逐件记录不变）
+```
+
 ## 目录结构
 
 ```
 src/
-  server.js     Express 服务与路由、原子发布/核验/预约/停用/运行/保养/校准事务
-  db.js         SQLite 连接、建表（含固定孔位表、离心运行表、设备上限/保养/校准表）、数据访问
+  server.js     Express 服务与路由、原子发布/核验/预约/停用/运行/保养/校准/领还事务
+  db.js         SQLite 连接、建表（含固定孔位表、离心运行表、设备上限/保养/校准表、
+                配重块实物编号与领还表）、数据访问
   solver.js     求解器（含避邻对与固定孔位约束）、独立复核、数据指纹（纯函数，含测试）
   verify.js     现场核验：录入规整、进度、完成判定（纯函数，含测试）
   reserve.js    时段预约与临时停用：UTC 解析、冻结图占用、双层扫描线（占用+停用）
@@ -807,9 +929,12 @@ src/
                 （纯函数，含测试）
   calibration.js 设备校准：校准登记输入规整、登记时序（早于到期/不晚于当前/晚于上一条）
                 与开始运行放行判定（最新记录合格且到期不早于预约终点）（纯函数，含测试）
+  checkout.js   配重块实物领还：实物登记/领用/归还输入规整、按规格精确匹配冻结占用量、
+                未还件与逾期状态汇总（纯函数，含测试）
   validate.js   输入校验（非法质量/重复编号/越界/避邻对/固定孔位）、400/409 错误类型
 public/         浏览器界面（原生 HTML/CSS/JS，无需构建）
 test/           node --test 测试（求解器 + 避邻对 + 固定孔位 + HTTP API + 核验
-                + 时段预约 + 临时停用 + 离心运行 + 设备保养 + 设备校准，共 152 项）
+                + 时段预约 + 临时停用 + 离心运行 + 设备保养 + 设备校准
+                + 配重块实物领还，共 172 项）
 Dockerfile / docker-compose.yml
 ```

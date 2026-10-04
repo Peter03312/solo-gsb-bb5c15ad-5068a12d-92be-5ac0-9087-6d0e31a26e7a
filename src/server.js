@@ -56,6 +56,19 @@ import {
   listCalibrationRowsByDevice,
   getLatestCalibrationRow,
   insertCalibration,
+  listWeightItemRows,
+  getWeightItemRow,
+  countRegisteredWeightItems,
+  insertWeightItem,
+  retireWeightItem,
+  markWeightItemDamaged,
+  getCheckoutRow,
+  getCheckoutRowByReservation,
+  listCheckoutRows,
+  listCheckoutItemRows,
+  getOpenCheckoutItemBySerial,
+  insertCheckout,
+  returnCheckoutItem,
 } from './db.js';
 import { solve, verify, computeHash } from './solver.js';
 import { normalizeEntries, measureProgress, verifyMeasurements } from './verify.js';
@@ -85,6 +98,13 @@ import {
   isLaterThanPrevious,
   checkCalibrationForRun,
 } from './calibration.js';
+import {
+  normalizeItemInput,
+  normalizeCheckoutInput,
+  normalizeReturnInput,
+  matchUsage,
+  summarizeCheckout,
+} from './checkout.js';
 import {
   ValidationError,
   ConflictError,
@@ -132,6 +152,8 @@ export function createApp(db) {
       devices: listDeviceViews(db),
       maintenances: listMaintenanceRows(db).map(maintenanceView),
       calibrations: listCalibrationRows(db).map((r) => calibrationView(r, Date.now())),
+      weightItems: listWeightItemRows(db).map((r) => weightItemView(r)),
+      checkouts: listCheckoutRows(db).map((r) => checkoutView(r, Date.now())),
     });
   });
 
@@ -263,6 +285,7 @@ export function createApp(db) {
   });
 
   // ---------- 配重块（整表替换，事务） ----------
+  // 库存缩减若低于已登记的在册（未注销）实物数，整次拒绝并保留原数据。
 
   app.put('/api/weights', (req, res, next) => {
     try {
@@ -270,6 +293,21 @@ export function createApp(db) {
         const current = loadData(db);
         const N = current ? current.holes : null;
         const clean = validateWeights(body, N);
+        // 调整后的各规格库存不得低于该规格已登记的在册实物数
+        const qtyMap = new Map(clean.map((w) => [w.mass, w.quantity]));
+        const short = countRegisteredWeightItems(db).filter(
+          (r) => r.c > (qtyMap.get(r.mass) ?? 0),
+        );
+        if (short.length > 0) {
+          throw new ValidationError([
+            '本次配重块调整会使库存低于已登记的在册实物数（未注销），已拒绝并保留原数据：',
+            ...short.map(
+              (r) =>
+                `规格 ${r.mass} g：在册实物 ${r.c} 件，调整后库存 ${qtyMap.get(r.mass) ?? 0} 枚`,
+            ),
+            '请先注销多余的实物编号，或保留足够的库存数量',
+          ]);
+        }
         db.prepare('DELETE FROM weights').run();
         const ins = db.prepare('INSERT INTO weights (mass, quantity) VALUES (?, ?)');
         clean.forEach((w) => ins.run(w.mass, w.quantity));
@@ -786,6 +824,359 @@ export function createApp(db) {
         const updated = revokeSuspension(db, id, toIso(nowMs));
         if (!updated) throw new ConflictError([`停用 #${id} 状态已变化，请刷新后重试`]);
         view = suspensionView(updated, nowMs);
+      });
+      tx();
+      res.json(view);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // ---------- 配重块实物编号与领还 ----------
+  //
+  // 实物编号按现有质量规格登记（serial 全局唯一，为幂等键）；同规格在册
+  // （未注销）实物数不得超过当前库存；已领出未归还的实物不能注销；库存缩减
+  // 若低于在册实物数，PUT /api/weights 整次拒绝（见上方配重块路由内的核对）。
+  //
+  // 领用：凭生效预约在其左闭右开时段 [start, end) 内领用；同一预约只可领用
+  // 一次（同内容重试返回原单、异内容 409）；所选实物按规格精确匹配预约冻结
+  // 占用量，且均在册可领用、未被其他未归还领用占用。领用时刻由服务端记录，
+  // 冻结预约时段与占用量；之后预约取消、库存调整及运行状态变化均不改写。
+  //
+  // 归还：逐件标记完好（intact）/损坏（damaged），可分批归还；非本单实物及
+  // 重复归还整次拒绝（409，不留部分记录）；损坏件不得再次领用；预约结束后
+  // 仍可归还。查询展示未还件与逾期状态（逾期 = 已过预约终点且仍有未还件）。
+
+  function weightItemView(row) {
+    const open = getOpenCheckoutItemBySerial(db, row.serial);
+    return {
+      serial: row.serial,
+      mass: row.mass,
+      status: row.status,
+      createdAt: row.created_at,
+      retiredAt: row.retired_at,
+      // 当前是否处于领出状态及所在领用单（展示用）
+      checkedOut: !!open,
+      checkoutId: open ? open.checkout_id : null,
+    };
+  }
+
+  function checkoutView(row, nowMs) {
+    const items = listCheckoutItemRows(db, row.id).map((r) => ({
+      serial: r.serial,
+      mass: r.mass,
+      state: r.returned_at ? r.return_condition : 'out',
+      returnedAt: r.returned_at,
+    }));
+    const summary = summarizeCheckout(
+      items.map((i) => ({ serial: i.serial, returnedAt: i.returnedAt })),
+      Date.parse(row.frozen_end_utc),
+      nowMs,
+    );
+    const resRow = getReservationRow(db, row.reservation_id);
+    return {
+      id: row.id,
+      reservationId: row.reservation_id,
+      batchNo: resRow ? resRow.batch_no : null,
+      createdAt: row.created_at,
+      // 冻结的预约时段与占用量（领用时写入，之后不改写）；
+      // currentStatus 仅展示用：预约取消不改写领还历史
+      reservation: {
+        startUtc: row.frozen_start_utc,
+        endUtc: row.frozen_end_utc,
+        usage: JSON.parse(row.frozen_usage_json),
+        currentStatus: resRow ? resRow.status : null,
+      },
+      items,
+      total: summary.total,
+      returnedCount: summary.returnedCount,
+      unreturnedCount: summary.unreturnedCount,
+      unreturned: summary.unreturned,
+      status: summary.status,
+      overdue: summary.overdue,
+      closedAt: summary.closedAt,
+    };
+  }
+
+  app.get('/api/weight-items', (req, res) => {
+    res.json(listWeightItemRows(db).map((r) => weightItemView(r)));
+  });
+
+  // 登记实物编号：唯一编号 + 现有质量规格；同规格在册数不得超过当前库存。
+  // 201 新建；同号同规格 200 幂等；同号异规格 409；未知规格 400；超库存 409。
+  app.post('/api/weight-items', (req, res, next) => {
+    try {
+      const { errors, clean } = normalizeItemInput(req.body);
+      if (errors.length) throw new ValidationError(errors);
+      const { serial, mass } = clean;
+
+      let status = 201;
+      let view;
+      const tx = db.transaction(() => {
+        // 幂等：同编号——规格一致返回原记录，不一致拒绝
+        const existing = getWeightItemRow(db, serial);
+        if (existing) {
+          if (existing.mass !== mass) {
+            throw new ConflictError(
+              [
+                `实物编号「${serial}」已登记（规格 ${existing.mass} g），` +
+                  `与本次规格 ${mass} g 不同，拒绝重复登记`,
+              ],
+              { detail: { serial: existing.serial, mass: existing.mass } },
+            );
+          }
+          view = weightItemView(existing);
+          status = 200;
+          return;
+        }
+        // 须为当前录入的质量规格，且同规格在册实物数不得超过当前库存
+        const data = loadData(db);
+        const spec = data && data.weights.find((w) => w.mass === mass);
+        if (!spec) {
+          throw new ValidationError([
+            `未知质量规格 ${mass} g：当前配重块录入中不存在该规格，不能登记实物编号`,
+          ]);
+        }
+        const row0 = countRegisteredWeightItems(db).find((r) => r.mass === mass);
+        const registered = row0 ? row0.c : 0;
+        if (registered + 1 > spec.quantity) {
+          throw new ConflictError(
+            [
+              `规格 ${mass} g 当前库存 ${spec.quantity} 枚，已登记在册实物 ${registered} 件，` +
+                `再登记「${serial}」将超过库存，拒绝登记`,
+            ],
+            { detail: { mass, capacity: spec.quantity, registered } },
+          );
+        }
+        const row = insertWeightItem(db, { serial, mass });
+        view = weightItemView(row);
+      });
+      tx();
+      res.status(status).json(view);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // 注销实物：已领出（未归还）的实物不能注销；已注销幂等返回原记录（历史保留）。
+  app.post('/api/weight-items/:serial/retire', (req, res, next) => {
+    try {
+      const serial = String(req.params.serial || '').trim();
+      if (!serial) throw new ValidationError(['实物编号不能为空']);
+      const existed = getWeightItemRow(db, serial);
+      if (!existed) return res.status(404).json({ error: '实物编号不存在' });
+      let view;
+      const tx = db.transaction(() => {
+        const row = getWeightItemRow(db, serial);
+        if (row.status === 'retired') {
+          view = weightItemView(row);
+          return;
+        }
+        const open = getOpenCheckoutItemBySerial(db, serial);
+        if (open) {
+          throw new ConflictError(
+            [
+              `实物「${serial}」当前处于领出状态（领用单 #${open.checkout_id} 未归还），` +
+                '已领出实物不能注销',
+            ],
+            { detail: { checkoutId: open.checkout_id } },
+          );
+        }
+        const updated = retireWeightItem(db, serial, toIso(Date.now()));
+        if (!updated) throw new ConflictError([`实物「${serial}」状态已变化，请刷新后重试`]);
+        view = weightItemView(updated);
+      });
+      tx();
+      res.json(view);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // 领用：凭生效预约在左闭右开时段内领用；所选实物按规格精确匹配冻结占用量，
+  // 且均在册可领用、未被其他未归还领用占用。同一预约只可领用一次：
+  // 同内容重试返回原单（200），异内容拒绝（409，附 existingId）。
+  app.post('/api/checkouts', (req, res, next) => {
+    try {
+      const { errors, clean } = normalizeCheckoutInput(req.body);
+      if (errors.length) throw new ValidationError(errors);
+      const { reservationId, serials } = clean;
+
+      let status = 201;
+      let view;
+      const tx = db.transaction(() => {
+        // 幂等：同一预约只可领用一次——实物清单一致返回原单，不一致拒绝
+        const existing = getCheckoutRowByReservation(db, reservationId);
+        if (existing) {
+          const existingSerials = listCheckoutItemRows(db, existing.id).map((r) => r.serial);
+          const wanted = [...serials].sort();
+          const same =
+            existingSerials.length === wanted.length &&
+            existingSerials.every((s, i) => s === wanted[i]);
+          if (!same) {
+            throw new ConflictError(
+              [
+                `预约 #${reservationId} 已存在领用单 #${existing.id}（同一预约只可领用一次），` +
+                  '且本次实物清单与其不同，拒绝重复领用',
+              ],
+              { existingId: existing.id },
+            );
+          }
+          view = checkoutView(existing, Date.now());
+          status = 200;
+          return;
+        }
+
+        // 生效预约 + 当前时刻处于其左闭右开时段
+        const resRow = getReservationRow(db, reservationId);
+        if (!resRow) {
+          throw new ValidationError([`预约记录 #${reservationId} 不存在（未知预约编号）`]);
+        }
+        if (resRow.status !== 'active') {
+          throw new ConflictError([
+            `预约 #${reservationId} 已取消，不能用于领用配重块（历史预约保留）`,
+          ]);
+        }
+        const nowMs = Date.now();
+        const startMs = Date.parse(resRow.start_utc);
+        const endMs = Date.parse(resRow.end_utc);
+        if (!isWithinReservation(startMs, endMs, nowMs)) {
+          throw new ConflictError([
+            nowMs < startMs
+              ? `当前时刻早于预约开始时间 ${resRow.start_utc}，尚未到领用时段（时段左闭右开）`
+              : `当前时刻已到/超过预约终点 ${resRow.end_utc}（时段左闭右开），不能领用`,
+          ]);
+        }
+
+        // 实物须全部已登记
+        const bySerial = new Map();
+        const unknown = [];
+        for (const s of serials) {
+          const item = getWeightItemRow(db, s);
+          if (item) bySerial.set(s, item);
+          else unknown.push(s);
+        }
+        if (unknown.length) {
+          throw new ValidationError([
+            `以下实物编号未登记，不能领用：${unknown.map((s) => `「${s}」`).join('')}`,
+          ]);
+        }
+        const items = serials.map((s) => bySerial.get(s));
+
+        // 所选实物按规格精确匹配预约冻结占用量
+        const usage = JSON.parse(resRow.usage_json);
+        const match = matchUsage(items, usage);
+        if (!match.ok) {
+          throw new ValidationError([
+            `所选实物与预约 #${reservationId} 的冻结占用量不符（须按规格精确匹配）：`,
+            ...match.errors,
+          ]);
+        }
+
+        // 均在册可领用（损坏/已注销不得领用），且未被其他未归还领用占用
+        const stateErrors = [];
+        for (const item of items) {
+          if (item.status === 'retired') {
+            stateErrors.push(`实物「${item.serial}」已注销，不能领用`);
+          } else if (item.status === 'damaged') {
+            stateErrors.push(`实物「${item.serial}」归还时已报损，损坏件不得再次领用`);
+          }
+        }
+        for (const item of items) {
+          const open = getOpenCheckoutItemBySerial(db, item.serial);
+          if (open) {
+            stateErrors.push(
+              `实物「${item.serial}」当前被领用单 #${open.checkout_id} 占用（未归还）`,
+            );
+          }
+        }
+        if (stateErrors.length) {
+          throw new ConflictError(['所选实物当前不可领用：', ...stateErrors]);
+        }
+
+        const row = insertCheckout(db, {
+          reservationId,
+          createdAt: toIso(nowMs),
+          startUtc: resRow.start_utc,
+          endUtc: resRow.end_utc,
+          usage,
+          items: items.map((it) => ({ serial: it.serial, mass: it.mass })),
+        });
+        view = checkoutView(row, nowMs);
+      });
+      tx();
+      res.status(status).json(view);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  app.get('/api/checkouts', (req, res, next) => {
+    try {
+      const nowMs = Date.now();
+      if (req.query.reservationId !== undefined) {
+        const rid = Number(req.query.reservationId);
+        if (!Number.isInteger(rid) || rid <= 0) {
+          throw new ValidationError(['reservationId 必须是预约编号（正整数）']);
+        }
+        const row = getCheckoutRowByReservation(db, rid);
+        return res.json(row ? [checkoutView(row, nowMs)] : []);
+      }
+      res.json(listCheckoutRows(db).map((r) => checkoutView(r, nowMs)));
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  app.get('/api/checkouts/:id', (req, res) => {
+    const row = getCheckoutRow(db, Number(req.params.id));
+    if (!row) return res.status(404).json({ error: '领用单不存在' });
+    res.json(checkoutView(row, Date.now()));
+  });
+
+  // 归还：逐件标记完好/损坏，可分批；非本单实物及重复归还整次拒绝（事务回滚，
+  // 不留部分记录）；损坏件不得再次领用；预约结束后仍可归还。
+  app.post('/api/checkouts/:id/return', (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const existed = getCheckoutRow(db, id);
+      if (!existed) return res.status(404).json({ error: '领用单不存在' });
+      const { errors, clean } = normalizeReturnInput(req.body);
+      if (errors.length) throw new ValidationError(errors);
+
+      let view;
+      const tx = db.transaction(() => {
+        const rows = listCheckoutItemRows(db, id);
+        const bySerial = new Map(rows.map((r) => [r.serial, r]));
+        const notMine = [];
+        const already = [];
+        for (const it of clean.items) {
+          const row = bySerial.get(it.serial);
+          if (!row) notMine.push(it.serial);
+          else if (row.returned_at) already.push(it.serial);
+        }
+        if (notMine.length) {
+          throw new ConflictError([
+            `以下实物不属于领用单 #${id}（非本单实物），整次拒绝：` +
+              notMine.map((s) => `「${s}」`).join(''),
+          ]);
+        }
+        if (already.length) {
+          throw new ConflictError([
+            `以下实物已归还（重复归还），整次拒绝：` +
+              already.map((s) => `「${s}」`).join(''),
+          ]);
+        }
+        const nowIso = toIso(Date.now());
+        for (const it of clean.items) {
+          const ok = returnCheckoutItem(db, id, it.serial, {
+            returnedAt: nowIso,
+            condition: it.condition,
+          });
+          if (!ok) throw new ConflictError([`实物「${it.serial}」状态已变化，请刷新后重试`]);
+          if (it.condition === 'damaged') markWeightItemDamaged(db, it.serial);
+        }
+        view = checkoutView(getCheckoutRow(db, id), Date.now());
       });
       tx();
       res.json(view);
